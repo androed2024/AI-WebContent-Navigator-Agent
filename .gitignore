@@ -1,0 +1,66 @@
+# .gitignore
+.venv*
+__pycache__/
+*.pyc
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+.Python
+
+# Virtual Environments
+.venv/
+venv/
+env/
+ENV/
+*.env
+*.env.*
+
+# Streamlit cache
+.streamlit/
+.cache/
+**/.ipynb_checkpoints/
+
+# MacOS
+.DS_Store
+
+# VSCode
+.vscode/
+
+# Playwright browser binaries
+playwright/.cache/
+ms-playwright/
+
+# Supabase generated artifacts
+.supabase/
+
+# Logs and misc
+*.log
+*.sqlite
+*.db
+*.bak
+
+# OS/filesystem
+Thumbs.db
+ehthumbs.db
+Icon?
+Desktop.ini
+
+# Jupyter Notebooks
+*.ipynb
+
+# dotenv default file
+.env.local
+.env.production
+.env.development
+
+# Node.js (falls du npm/Playwright per JS nutzt)
+node_modules/
+package-lock.json
+yarn.lock
+
