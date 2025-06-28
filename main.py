@@ -115,11 +115,12 @@ def chunk_with_overlap(text, chunk_size=365, overlap=50):
     return chunks
 
 
-def save_chunks(url, chunks, embeddings, page_number=None):
+def save_chunks(url, chunks, embeddings, page_number=None, source_page_url=None):
     rows = []
     for idx, (text, emb) in enumerate(zip(chunks, embeddings)):
         metadata = {
             "source_url": url,
+            "source_page_url": source_page_url or url,
             "page": page_number or idx + 1,
             "chunk_index": idx + 1,
         }
@@ -166,12 +167,11 @@ def find_links_recursive(
         for a in soup.find_all("a", href=True):
             href = a["href"].strip()
             full_url = urljoin(base_url, href)
-            # ==== PDF-Links: IMMER aufnehmen, auch extern! ====
             if is_pdf_like(full_url) and len(pdf_links) < max_pdfs:
                 print(f"🔗 PDF gefunden: {full_url} (von: {base_url})")
-                pdf_links.add(full_url)
+                # Speichere als Tupel: (pdf_url, html_seite_davon)
+                pdf_links.add((full_url, base_url))
                 continue
-            # ==== HTML-Links: nur intern! ====
             if urlparse(full_url).netloc != domain:
                 continue
             if full_url.lower().endswith(".zip"):
@@ -204,9 +204,9 @@ def crawl():
         html_saved += h
         chunk_count += c
 
-    for i, url in enumerate(sorted(pdf_links)):
-        print(f"📄 PDF-Datei {i + 1}: {url}")
-        _, p, c = process_url(url, is_pdf=True)
+    for i, (pdf_url, source_page_url) in enumerate(sorted(pdf_links)):
+        print(f"📄 PDF-Datei {i + 1}: {pdf_url} (gefunden auf {source_page_url})")
+        _, p, c = process_url(pdf_url, is_pdf=True, source_page_url=source_page_url)
         pdf_saved += p
         chunk_count += c
 
@@ -216,7 +216,9 @@ def crawl():
     print(f"   • 🔹 {chunk_count} Chunks gespeichert")
 
 
-def process_url(url: str, is_pdf: bool = False) -> tuple[int, int, int]:
+def process_url(
+    url: str, is_pdf: bool = False, source_page_url: str = None
+) -> tuple[int, int, int]:
     print(f"🔍 Verarbeite URL: {url} (PDF: {is_pdf})")
     if is_pdf:
         try:
@@ -232,7 +234,12 @@ def process_url(url: str, is_pdf: bool = False) -> tuple[int, int, int]:
             embeddings = openai_cli.embeddings.create(
                 model="text-embedding-3-small", input=all_chunks
             )
-            save_chunks(url, all_chunks, [d.embedding for d in embeddings.data])
+            save_chunks(
+                url,
+                all_chunks,
+                [d.embedding for d in embeddings.data],
+                source_page_url=source_page_url,
+            )
             print(f"✅ PDF gespeichert: {url}")
             return 0, 1, len(all_chunks)
         except Exception as e:
@@ -274,7 +281,6 @@ st.title("RAG Chatbot")
 question = st.text_input("Frage eingeben:")
 if question:
     with st.spinner("Suche läuft..."):
-        # Retrieval + Reranking:
         embedding_model = OpenAIEmbeddings(model="text-embedding-3-small")
         vectorstore = SupabaseVectorStore(
             client=supabase,
@@ -296,14 +302,9 @@ if question:
             scores = cross_encoder.predict(cross_input)
             for i, (doc, score) in enumerate(zip(docs, scores)):
                 print(f"Score: {score:.3f} | {doc.metadata.get('source_url')}")
-            threshold = 0.3
+            threshold = 0.6
             scored_docs = sorted(zip(docs, scores), key=lambda x: x[1], reverse=True)
             filtered_docs = [doc for doc, score in scored_docs if score >= threshold]
-            print(
-                f"⚖️ {len(filtered_docs)}/{len(scored_docs)} nach Threshold >= {threshold}"
-            )
-            for i, doc in enumerate(filtered_docs):
-                print(f"[KEPT] {doc.metadata.get('source_url')}")
             texts = [
                 doc.page_content for doc in filtered_docs if doc.page_content.strip()
             ]
@@ -320,8 +321,31 @@ if question:
                 st.write(response.content.strip())
                 if filtered_docs:
                     st.subheader("Quellen:")
-                    for doc in filtered_docs[:5]:
-                        meta = doc.metadata
-                        st.markdown(
-                            f"- [Seite öffnen]({meta.get('source_url')}) (Seite {meta.get('page')})"
-                        )
+
+    url_to_pages = defaultdict(list)
+    url_to_display = {}
+    url_to_pdfs = {}
+    for doc in filtered_docs:
+        meta = doc.metadata
+        source_url = meta.get("source_url")
+        display_url = meta.get("source_page_url") or source_url
+        page = meta.get("page")
+        if display_url:
+            url_to_pages[display_url].append(page)
+            url_to_display[display_url] = display_url
+            url_to_pdfs[display_url] = source_url  # zusätzlich PDF merken
+
+    for url, pages in url_to_pages.items():
+        pages_str = ", ".join(str(p) for p in sorted(set(pages)))
+        st.markdown(
+            f'- <a href="{url}" target="_blank" rel="noopener noreferrer">Seite öffnen</a> '
+            f'(Seite{"n" if len(pages)>1 else ""} {pages_str})',
+            unsafe_allow_html=True,
+        )
+        pdf_url = url_to_pdfs.get(url)
+        if pdf_url and is_pdf_like(pdf_url):
+            st.markdown(
+                f'<span title="PDF direkt öffnen" style="color: red">📄 <a href="{pdf_url}" target="_blank" rel="noopener noreferrer">PDF öffnen</a></span>',
+                unsafe_allow_html=True,
+            )
+        pages_str = ", ".join(str(p) for p in sorted(set(pages)))
