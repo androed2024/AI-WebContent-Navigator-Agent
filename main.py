@@ -37,7 +37,7 @@ if not all([SUPABASE_URL, SUPABASE_KEY, OPENAI_API_KEY]):
 
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 openai_cli = OpenAI(api_key=OPENAI_API_KEY)
-llm = ChatOpenAI(model_name="gpt-3.5-turbo", temperature=0.9)
+llm = ChatOpenAI(model_name="gpt-4o", temperature=0.9)
 embedding_model = OpenAIEmbeddings(model="text-embedding-3-small")
 cross_encoder = CrossEncoder(
     "cross-encoder/ms-marco-MiniLM-L-6-v2", activation_fn=torch.nn.Tanh()
@@ -348,24 +348,37 @@ if question:
         lang = detect(question)
 
         print(f"\n---[RAG Retrieval]---\nFrage: {question}")
-        docs = vectorstore.similarity_search(question, k=15)
+        docs = vectorstore.similarity_search(question, k=10)
         print(f"🔎 similarity_search → {len(docs)} Treffer")
         for i, doc in enumerate(docs):
             snippet = doc.page_content[:120].replace("\n", " ")
             print(f"[{i+1}] {snippet} ... (URL: {doc.metadata.get('source_url')})")
 
         if not docs:
-            answer = "Dazu habe ich leider keine Informationen gefunden, die auf unserer Webseite verfügbar sind."
-            st.session_state.chat_history.append((question, answer))
+            st.session_state.chat_history.append(
+                (
+                    question,
+                    "Dazu habe ich leider keine Informationen gefunden, die auf unserer Webseite verfügbar sind.",
+                )
+            )
             st.session_state.chat_links.append([])
         else:
-            cross_input = [[question, doc.page_content] for doc in docs]
-            scores = cross_encoder.predict(cross_input)
+            cross_input = [
+                [question, doc.page_content] for doc in docs if doc.page_content.strip()
+            ]
+            if cross_input:
+                scores = cross_encoder.predict(cross_input)
+            else:
+                scores = []
+
             for i, (doc, score) in enumerate(zip(docs, scores)):
                 print(f"Score: {score:.3f} | {doc.metadata.get('source_url')}")
-            threshold = 0.6
+
+            threshold = 0.7
             scored_docs = sorted(zip(docs, scores), key=lambda x: x[1], reverse=True)
-            filtered_docs = [doc for doc, score in scored_docs if score >= threshold]
+            filtered_docs = [doc for doc, score in scored_docs if score >= threshold][
+                :3
+            ]
 
             if not filtered_docs and scored_docs:
                 best_doc, best_score = scored_docs[0]
@@ -384,7 +397,6 @@ if question:
                 st.session_state.chat_links.append([])
             else:
                 context = "\n\n".join(texts)
-
                 main_link = ""
                 for doc in filtered_docs:
                     meta = doc.metadata
@@ -392,10 +404,11 @@ if question:
                     if main_link:
                         break
 
+                # print(f"📊 Prompt-Token-Länge: {len(context)}")
+
                 if lang == "de":
                     if answer_mode == "link-only":
                         link_text = main_link if main_link else "unsere Webseite"
-
                         prompt = f"""
 Ein Nutzer stellt dir eine Frage und möchte wissen, ob es dazu Inhalte auf unserer Webseite gibt.
 
