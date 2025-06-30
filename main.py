@@ -24,7 +24,10 @@ load_dotenv()
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_API_KEY")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-BASE_URL = "https://www.11mind.com/"
+BASE_URL = os.getenv("BASE_URL")
+
+MIN_CHUNK_TOKENS_HTML = int(os.getenv("MIN_CHUNK_TOKENS_HTML", "100"))
+# BASE_URL = "https://www.lfk-online.de/pflegedienste.html/"
 
 print("BASE URL", BASE_URL)
 
@@ -40,7 +43,7 @@ cross_encoder = CrossEncoder(
     "cross-encoder/ms-marco-MiniLM-L-6-v2", activation_fn=torch.nn.Tanh()
 )
 
-html_counter = pdf_counter = total_chunks = 0
+# html_counter = pdf_counter = total_chunks = 0
 
 
 # ────────────────────────────── Utils ──────────────────────────────
@@ -105,18 +108,31 @@ def extract_pdf_pages(data):
         return []
 
 
-def chunk_with_overlap(text, chunk_size=365, overlap=50):
+def chunk_with_overlap(text, chunk_size=365, overlap=50, min_tokens=0):
     enc = tiktoken.get_encoding("cl100k_base")
     tokens = enc.encode(text)
+    if len(tokens) < min_tokens:
+        print(
+            f"⚠️ Zu wenig Tokens: {len(tokens)} (<{min_tokens}). Text (gekürzt): {repr(text[:120])}"
+        )
+        return []
+    if len(tokens) < min_tokens:
+        return []
     chunks = [
         enc.decode(tokens[i : i + chunk_size])
         for i in range(0, len(tokens) - chunk_size + 1, chunk_size - overlap)
     ]
+    if not chunks and tokens:
+        chunks = [enc.decode(tokens)]
     return chunks
 
 
-def save_chunks(url, chunks, embeddings, page_number=None, source_page_url=None):
+def save_chunks(
+    url, chunks, embeddings, page_number=None, source_page_url=None, anchor_text=None
+):
     rows = []
+    original_filename = os.path.basename(url) if is_pdf_like(url) else None
+
     for idx, (text, emb) in enumerate(zip(chunks, embeddings)):
         metadata = {
             "source_url": url,
@@ -124,7 +140,13 @@ def save_chunks(url, chunks, embeddings, page_number=None, source_page_url=None)
             "page": page_number or idx + 1,
             "chunk_index": idx + 1,
         }
+        if anchor_text:
+            metadata["anchor_text"] = anchor_text
+        if original_filename:
+            metadata["original_filename"] = original_filename
+
         rows.append({"content": text, "metadata": metadata, "embedding": emb})
+
     print(f"💾 Speichere {len(rows)} Chunks → {url}")
     supabase.table("lfk_rag_documents").insert(rows).execute()
 
@@ -164,14 +186,17 @@ def find_links_recursive(
         resp = requests.get(base_url, timeout=10)
         soup = BeautifulSoup(resp.content, "html.parser")
         domain = urlparse(base_url).netloc
+
         for a in soup.find_all("a", href=True):
             href = a["href"].strip()
             full_url = urljoin(base_url, href)
+
             if is_pdf_like(full_url) and len(pdf_links) < max_pdfs:
                 print(f"🔗 PDF gefunden: {full_url} (von: {base_url})")
-                # Speichere als Tupel: (pdf_url, html_seite_davon)
-                pdf_links.add((full_url, base_url))
+                anchor = a.get_text(strip=True) or None
+                pdf_links.add((full_url, base_url, anchor))
                 continue
+
             if urlparse(full_url).netloc != domain:
                 continue
             if full_url.lower().endswith(".zip"):
@@ -198,15 +223,23 @@ def crawl():
     print(f"📊 Gefundene Seiten: {len(html_links)} HTML, {len(pdf_links)} PDF")
     html_saved = pdf_saved = chunk_count = 0
 
-    for i, url in enumerate(sorted(html_links)):
-        print(f"➡️ HTML-Seite {i + 1}: {url}")
-        h, _, c = process_url(url, is_pdf=False)
+    # html Content
+    for i, (html_url) in enumerate(sorted(html_links)):
+        print(f"🌐 HTML-Seite {i + 1}: {html_url}")
+        h, p, c = process_url(html_url, is_pdf=False)
         html_saved += h
+        pdf_saved += p
         chunk_count += c
 
-    for i, (pdf_url, source_page_url) in enumerate(sorted(pdf_links)):
+    # pdf content / files
+    for i, (pdf_url, source_page_url, anchor_text) in enumerate(sorted(pdf_links)):
         print(f"📄 PDF-Datei {i + 1}: {pdf_url} (gefunden auf {source_page_url})")
-        _, p, c = process_url(pdf_url, is_pdf=True, source_page_url=source_page_url)
+        _, p, c = process_url(
+            pdf_url,
+            is_pdf=True,
+            source_page_url=source_page_url,
+            anchor_text=anchor_text,
+        )
         pdf_saved += p
         chunk_count += c
 
@@ -217,7 +250,7 @@ def crawl():
 
 
 def process_url(
-    url: str, is_pdf: bool = False, source_page_url: str = None
+    url: str, is_pdf: bool = False, source_page_url: str = None, anchor_text: str = None
 ) -> tuple[int, int, int]:
     print(f"🔍 Verarbeite URL: {url} (PDF: {is_pdf})")
     if is_pdf:
@@ -239,7 +272,9 @@ def process_url(
                 all_chunks,
                 [d.embedding for d in embeddings.data],
                 source_page_url=source_page_url,
+                anchor_text=anchor_text,
             )
+
             print(f"✅ PDF gespeichert: {url}")
             return 0, 1, len(all_chunks)
         except Exception as e:
@@ -251,14 +286,16 @@ def process_url(
             if not text.strip():
                 print("⚠️ HTML hat keinen sichtbaren Text.")
                 return 0, 0, 0
-            chunks = chunk_with_overlap(text)
+            chunks = chunk_with_overlap(text, min_tokens=MIN_CHUNK_TOKENS_HTML)
             if not chunks:
-                print("⚠️ HTML hat keine Chunks.")
+                print("⚠️ HTML hat keine Chunks bzw <100 token.")
                 return 0, 0, 0
             embeddings = openai_cli.embeddings.create(
                 model="text-embedding-3-small", input=chunks
             )
-            save_chunks(url, chunks, [d.embedding for d in embeddings.data])
+            save_chunks(
+                url, chunks, [d.embedding for d in embeddings.data], anchor_text=None
+            )
             print(f"✅ HTML gespeichert: {url}")
             return 1, 0, len(chunks)
         except Exception as e:
@@ -277,8 +314,28 @@ else:
     print("⏩ Daten bereits vorhanden – überspringe Crawling.")
 
 # ▶️ Streamlit Chatbot UI
-st.title("RAG Chatbot")
-question = st.text_input("Frage eingeben:")
+st.image("lfk_logo.jpg", width=150)
+st.title("KI Web Assistent vom LfK")
+with st.chat_message("assistant"):
+    st.markdown(
+        "**Hallo, ich bin der KI-Webassistent des LfK. Wie kann ich Ihnen helfen?**<br>"
+        "Suchen Sie bestimmte Informationen auf unserer Webseite?",
+        unsafe_allow_html=True,
+    )
+
+answer_mode = (
+    "link-only"
+    if st.toggle("Nur Link-Antwort anzeigen (Demo-Modus)", value=True)
+    else "volltext"
+)
+
+if "chat_history" not in st.session_state:
+    st.session_state.chat_history = []
+
+if "chat_links" not in st.session_state:
+    st.session_state.chat_links = []
+
+question = st.chat_input("Frage eingeben:")
 if question:
     with st.spinner("Suche läuft..."):
         embedding_model = OpenAIEmbeddings(model="text-embedding-3-small")
@@ -289,14 +346,18 @@ if question:
             query_name="match_rag_pages",
         )
         lang = detect(question)
+
         print(f"\n---[RAG Retrieval]---\nFrage: {question}")
         docs = vectorstore.similarity_search(question, k=15)
         print(f"🔎 similarity_search → {len(docs)} Treffer")
         for i, doc in enumerate(docs):
             snippet = doc.page_content[:120].replace("\n", " ")
             print(f"[{i+1}] {snippet} ... (URL: {doc.metadata.get('source_url')})")
+
         if not docs:
-            st.warning("Keine passenden Informationen gefunden.")
+            answer = "Dazu habe ich leider keine Informationen gefunden, die auf unserer Webseite verfügbar sind."
+            st.session_state.chat_history.append((question, answer))
+            st.session_state.chat_links.append([])
         else:
             cross_input = [[question, doc.page_content] for doc in docs]
             scores = cross_encoder.predict(cross_input)
@@ -305,47 +366,118 @@ if question:
             threshold = 0.6
             scored_docs = sorted(zip(docs, scores), key=lambda x: x[1], reverse=True)
             filtered_docs = [doc for doc, score in scored_docs if score >= threshold]
+
+            if not filtered_docs and scored_docs:
+                best_doc, best_score = scored_docs[0]
+                print(
+                    f"⚠️ Fallback aktiv: Score war {best_score:.3f}, aber bestes Doc wird genutzt."
+                )
+                filtered_docs = [best_doc]
+
             texts = [
                 doc.page_content for doc in filtered_docs if doc.page_content.strip()
             ]
+
             if not texts:
-                st.warning("Keine ausreichenden Inhalte.")
+                answer = "Dazu habe ich leider keine Informationen gefunden, die auf unserer Webseite verfügbar sind."
+                st.session_state.chat_history.append((question, answer))
+                st.session_state.chat_links.append([])
             else:
                 context = "\n\n".join(texts)
+
+                main_link = ""
+                for doc in filtered_docs:
+                    meta = doc.metadata
+                    main_link = meta.get("source_page_url") or meta.get("source_url")
+                    if main_link:
+                        break
+
                 if lang == "de":
-                    prompt = f"Frage: {question}\n\nBitte nur basierend auf dem folgenden Text antworten:\n\n{context}"
+                    if answer_mode == "link-only":
+                        link_text = main_link if main_link else "unsere Webseite"
+
+                        prompt = f"""
+Ein Nutzer stellt dir eine Frage und möchte wissen, ob es dazu Inhalte auf unserer Webseite gibt.
+
+Bitte beachte folgende Regeln:
+
+1. Wenn es zu der Frage **relevante Inhalte auf der Webseite** gibt, antworte **immer genau so**:
+"Ja, dazu gibt es Informationen auf unserer Webseite. Hier ist der passende Link: {link_text}."
+
+2. Wenn es **keine passenden Inhalte** auf der Webseite gibt, dann antworte:
+"Dazu habe ich leider keine Informationen gefunden, die auf unserer Webseite verfügbar sind."
+
+Wichtige Hinweise:
+- Du sollst **keinen** Inhalt zusammenfassen oder erklären.
+- Gib **niemals** weitere Details oder Textauszüge aus dem Kontext wieder.
+- Du antwortest **nur** mit einem der beiden Sätze oben, je nachdem ob der Kontext passt oder nicht.
+
+Hier ist die Nutzerfrage:
+{question}
+
+Hier ist der verfügbare Kontext:
+{context}
+"""
+                    else:
+                        prompt = f"""
+Du bist ein hilfreicher KI-Assistent. Beantworte die folgende Frage so gut wie möglich anhand des zur Verfügung gestellten Kontextes. Gib deine Antwort in gut verständlichem Deutsch und fasse den relevanten Inhalt zusammen. Antworte ausschließlich auf Basis des Kontextes. Gib keine erfundenen Informationen an.
+
+Frage:
+{question}
+
+Kontext:
+{context}
+"""
                 else:
-                    prompt = f"Question: {question}\n\nPlease answer ONLY based on the following content:\n\n{context}"
+                    prompt = f"Frage: {question}\n\nBitte antworte NUR auf der Grundlage des folgenden Inhalts:\n\n{context}"
+
                 response = llm.invoke(prompt)
-                st.subheader("Antwort:")
-                st.write(response.content.strip())
-                if filtered_docs:
-                    st.subheader("Quellen:")
+                st.session_state.chat_history.append(
+                    (question, response.content.strip())
+                )
+                st.session_state.chat_links.append(
+                    filtered_docs
+                    if "keine Informationen" not in response.content
+                    else []
+                )
 
-    url_to_pages = defaultdict(list)
-    url_to_display = {}
-    url_to_pdfs = {}
-    for doc in filtered_docs:
-        meta = doc.metadata
-        source_url = meta.get("source_url")
-        display_url = meta.get("source_page_url") or source_url
-        page = meta.get("page")
-        if display_url:
-            url_to_pages[display_url].append(page)
-            url_to_display[display_url] = display_url
-            url_to_pdfs[display_url] = source_url  # zusätzlich PDF merken
+# Anzeige Chatverlauf inkl. Links
+for idx, (question, answer) in enumerate(st.session_state.chat_history):
+    with st.chat_message("user"):
+        st.markdown(question)
+    with st.chat_message("assistant"):
+        st.markdown(answer)
 
-    for url, pages in url_to_pages.items():
-        pages_str = ", ".join(str(p) for p in sorted(set(pages)))
-        st.markdown(
-            f'- <a href="{url}" target="_blank" rel="noopener noreferrer">Seite öffnen</a> '
-            f'(Seite{"n" if len(pages)>1 else ""} {pages_str})',
-            unsafe_allow_html=True,
-        )
-        pdf_url = url_to_pdfs.get(url)
-        if pdf_url and is_pdf_like(pdf_url):
-            st.markdown(
-                f'<span title="PDF direkt öffnen" style="color: red">📄 <a href="{pdf_url}" target="_blank" rel="noopener noreferrer">PDF öffnen</a></span>',
-                unsafe_allow_html=True,
-            )
-        pages_str = ", ".join(str(p) for p in sorted(set(pages)))
+        docs = st.session_state.chat_links[idx]
+        if docs:
+            url_to_pages = defaultdict(list)
+            url_to_pdfs = {}
+            for doc in docs:
+                meta = doc.metadata
+                source_url = meta.get("source_url")
+                display_url = meta.get("source_page_url") or source_url
+                page = meta.get("page")
+                if display_url:
+                    url_to_pages[display_url].append(page)
+                    url_to_pdfs[display_url] = source_url
+
+            st.markdown("**Link:**")
+            for url, pages in url_to_pages.items():
+                pages_str = ", ".join(str(p) for p in sorted(set(pages)))
+                st.markdown(
+                    f'- <a href="{url}" target="_blank" rel="noopener noreferrer">{url}</a> '
+                    f'(Seite{"n" if len(pages)>1 else ""} {pages_str})',
+                    unsafe_allow_html=True,
+                )
+                pdf_url = url_to_pdfs.get(url)
+                if pdf_url and is_pdf_like(pdf_url):
+                    anchor_text = None
+                    for doc in docs:
+                        if doc.metadata.get("source_url") == pdf_url:
+                            anchor_text = doc.metadata.get("anchor_text")
+                            break
+                    label = anchor_text or "PDF öffnen"
+                    st.markdown(
+                        f'<span title="PDF direkt öffnen" style="color: red">📄 <a href="{pdf_url}" target="_blank" rel="noopener noreferrer">{label}</a></span>',
+                        unsafe_allow_html=True,
+                    )
