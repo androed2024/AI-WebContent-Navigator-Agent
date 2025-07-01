@@ -95,6 +95,34 @@ def fetch_rendered_text_playwright(url):
         return ""
 
 
+def extract_structured_html_sections(html: str, base_url: str) -> list[tuple[str, str]]:
+    soup = BeautifulSoup(html, "html.parser")
+    for tag in soup(["script", "style", "nav", "footer", "noscript"]):
+        tag.decompose()
+
+    sections = []
+    current_heading = None
+    current_text = []
+
+    for tag in soup.find_all(["h1", "h2", "h3", "p", "div"]):
+        if tag.name in ["h1", "h2", "h3"]:
+            if current_heading and current_text:
+                sections.append((current_heading, "\n".join(current_text).strip()))
+                current_text = []
+            current_heading = tag.get_text(strip=True)
+        else:
+            text = tag.get_text(strip=True)
+            if text:
+                if not current_heading:
+                    current_heading = "Allgemein"  # Dummy-Überschrift setzen
+                current_text.append(text)
+
+    if current_heading and current_text:
+        sections.append((current_heading, "\n".join(current_text).strip()))
+
+    return sections
+
+
 def extract_pdf_pages(data):
     try:
         doc = fitz.open(stream=data, filetype="pdf")
@@ -173,7 +201,7 @@ def check_existing_data():
 
 
 def find_links_recursive(
-    base_url, max_depth=2, max_pdfs=10, visited=None, current_depth=0
+    base_url, max_depth=3, max_pdfs=100, visited=None, current_depth=0
 ):
     if visited is None:
         visited = set()
@@ -282,14 +310,21 @@ def process_url(
             return 0, 0, 0
     else:
         try:
-            text = fetch_rendered_text_playwright(url)
-            if not text.strip():
-                print("⚠️ HTML hat keinen sichtbaren Text.")
+            html = fetch_rendered_text_playwright(url)
+            sections = extract_structured_html_sections(html, url)
+            if not sections:
+                print("⚠️ Keine Sections gefunden.")
                 return 0, 0, 0
-            chunks = chunk_with_overlap(text, min_tokens=MIN_CHUNK_TOKENS_HTML)
+
+            chunks = []
+            for heading, section_text in sections:
+                c = chunk_with_overlap(section_text, min_tokens=MIN_CHUNK_TOKENS_HTML)
+                chunks.extend(c)
+
             if not chunks:
                 print("⚠️ HTML hat keine Chunks bzw <100 token.")
                 return 0, 0, 0
+
             embeddings = openai_cli.embeddings.create(
                 model="text-embedding-3-small", input=chunks
             )
@@ -338,7 +373,6 @@ if "chat_links" not in st.session_state:
 question = st.chat_input("Frage eingeben:")
 if question:
     with st.spinner("Suche läuft..."):
-        embedding_model = OpenAIEmbeddings(model="text-embedding-3-small")
         vectorstore = SupabaseVectorStore(
             client=supabase,
             embedding=embedding_model,
@@ -374,85 +408,85 @@ if question:
             for i, (doc, score) in enumerate(zip(docs, scores)):
                 print(f"Score: {score:.3f} | {doc.metadata.get('source_url')}")
 
-            threshold = 0.7
+            # 📌 Ergänzung: filtered_docs setzen für spätere Anzeige
+            threshold = 0.75
             scored_docs = sorted(zip(docs, scores), key=lambda x: x[1], reverse=True)
-            filtered_docs = [doc for doc, score in scored_docs if score >= threshold][
-                :3
-            ]
-
-            if not filtered_docs and scored_docs:
-                best_doc, best_score = scored_docs[0]
+            for i, (doc, score) in enumerate(scored_docs):
                 print(
-                    f"⚠️ Fallback aktiv: Score war {best_score:.3f}, aber bestes Doc wird genutzt."
+                    f"📊 Finaler Score: {score:.3f} → {doc.metadata.get('source_url')}"
                 )
-                filtered_docs = [best_doc]
 
-            texts = [
-                doc.page_content for doc in filtered_docs if doc.page_content.strip()
+            filtered_docs = [doc for doc, score in scored_docs if score >= threshold][
+                :2
             ]
 
-            if not texts:
-                answer = "Dazu habe ich leider keine Informationen gefunden, die auf unserer Webseite verfügbar sind."
-                st.session_state.chat_history.append((question, answer))
-                st.session_state.chat_links.append([])
+            # Immer das bestbewertete Dokument für den Hauptlink nehmen:
+            best_doc = scored_docs[0][0]  # highest score
+            best_meta = best_doc.metadata
+            main_link = best_meta.get("source_url") or best_meta.get("source_page_url")
+
+            # 📌 Sonderfall: Wenn PDF, zeige lieber PDF-Link
+            if is_pdf_like(main_link):
+                print(f"✅ Top-Link (PDF): {main_link}")
             else:
-                context = "\n\n".join(texts)
-                main_link = ""
+                print(f"✅ Top-Link (HTML): {main_link}")
+
+            # 1️⃣ Robust: Wenn main_link fehlt, versuch Fallback zu setzen
+            if not main_link:
                 for doc in filtered_docs:
                     meta = doc.metadata
                     main_link = meta.get("source_page_url") or meta.get("source_url")
                     if main_link:
                         break
 
-                # print(f"📊 Prompt-Token-Länge: {len(context)}")
+            # 2️⃣ Prompt immer setzen – unabhängig von obiger if/else Struktur
+            if lang == "de":
+                if answer_mode == "link-only":
+                    link_text = main_link if main_link else "unsere Webseite"
+                    context = "\n\n".join(doc.page_content for doc in filtered_docs)
+                    prompt = f"""
+            Ein Nutzer stellt dir eine Frage und möchte wissen, ob es dazu Inhalte auf unserer Webseite gibt.
 
-                if lang == "de":
-                    if answer_mode == "link-only":
-                        link_text = main_link if main_link else "unsere Webseite"
-                        prompt = f"""
-Ein Nutzer stellt dir eine Frage und möchte wissen, ob es dazu Inhalte auf unserer Webseite gibt.
+            Bitte beachte folgende Regeln:
 
-Bitte beachte folgende Regeln:
+            1. Wenn es zu der Frage **relevante Inhalte auf der Webseite** gibt, antworte **immer genau so**:
+            "Ja, dazu gibt es Informationen auf unserer Webseite. Hier ist der passende Link: {link_text}."
 
-1. Wenn es zu der Frage **relevante Inhalte auf der Webseite** gibt, antworte **immer genau so**:
-"Ja, dazu gibt es Informationen auf unserer Webseite. Hier ist der passende Link: {link_text}."
+            2. Wenn es **keine passenden Inhalte** auf der Webseite gibt, dann antworte:
+            "Dazu habe ich leider keine Informationen gefunden, die auf unserer Webseite verfügbar sind."
 
-2. Wenn es **keine passenden Inhalte** auf der Webseite gibt, dann antworte:
-"Dazu habe ich leider keine Informationen gefunden, die auf unserer Webseite verfügbar sind."
+            Wichtige Hinweise:
+            - Du sollst **keinen** Inhalt zusammenfassen oder erklären.
+            - Gib **niemals** weitere Details oder Textauszüge aus dem Kontext wieder.
+            - Du antwortest **nur** mit einem der beiden Sätze oben, je nachdem ob der Kontext passt oder nicht.
 
-Wichtige Hinweise:
-- Du sollst **keinen** Inhalt zusammenfassen oder erklären.
-- Gib **niemals** weitere Details oder Textauszüge aus dem Kontext wieder.
-- Du antwortest **nur** mit einem der beiden Sätze oben, je nachdem ob der Kontext passt oder nicht.
+            Hier ist die Nutzerfrage:
+            {question}
 
-Hier ist die Nutzerfrage:
-{question}
-
-Hier ist der verfügbare Kontext:
-{context}
-"""
-                    else:
-                        prompt = f"""
-Du bist ein hilfreicher KI-Assistent. Beantworte die folgende Frage so gut wie möglich anhand des zur Verfügung gestellten Kontextes. Gib deine Antwort in gut verständlichem Deutsch und fasse den relevanten Inhalt zusammen. Antworte ausschließlich auf Basis des Kontextes. Gib keine erfundenen Informationen an.
-
-Frage:
-{question}
-
-Kontext:
-{context}
-"""
+            Hier ist der verfügbare Kontext:
+            {context}
+            """
                 else:
-                    prompt = f"Frage: {question}\n\nBitte antworte NUR auf der Grundlage des folgenden Inhalts:\n\n{context}"
+                    context = "\n\n".join(doc.page_content for doc in filtered_docs)
+                    prompt = f"""
+            Du bist ein hilfreicher KI-Assistent. Beantworte die folgende Frage so gut wie möglich anhand des zur Verfügung gestellten Kontextes. Gib deine Antwort in gut verständlichem Deutsch und fasse den relevanten Inhalt zusammen. Antworte ausschließlich auf Basis des Kontextes. Gib keine erfundenen Informationen an.
 
-                response = llm.invoke(prompt)
-                st.session_state.chat_history.append(
-                    (question, response.content.strip())
-                )
-                st.session_state.chat_links.append(
-                    filtered_docs
-                    if "keine Informationen" not in response.content
-                    else []
-                )
+            Frage:
+            {question}
+
+            Kontext:
+            {context}
+            """
+            else:
+                context = "\n\n".join(doc.page_content for doc in filtered_docs)
+                prompt = f"Frage: {question}\n\nBitte antworte NUR auf der Grundlage des folgenden Inhalts:\n\n{context}"
+
+            # 3️⃣ Antwort erzeugen
+            response = llm.invoke(prompt)
+            st.session_state.chat_history.append((question, response.content.strip()))
+            st.session_state.chat_links.append(
+                filtered_docs if "keine Informationen" not in response.content else []
+            )
 
 # Anzeige Chatverlauf inkl. Links
 for idx, (question, answer) in enumerate(st.session_state.chat_history):
@@ -472,7 +506,8 @@ for idx, (question, answer) in enumerate(st.session_state.chat_history):
                 page = meta.get("page")
                 if display_url:
                     url_to_pages[display_url].append(page)
-                    url_to_pdfs[display_url] = source_url
+                    if display_url not in url_to_pdfs and is_pdf_like(source_url):
+                        url_to_pdfs[display_url] = source_url
 
             st.markdown("**Link:**")
             for url, pages in url_to_pages.items():
