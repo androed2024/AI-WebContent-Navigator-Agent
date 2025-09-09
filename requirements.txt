@@ -1,3 +1,4 @@
+accelerate<0.33
 aiohappyeyeballs==2.6.1
 aiohttp==3.12.13
 aiosignal==1.3.2
@@ -88,7 +89,7 @@ rpds-py==0.25.1
 safetensors==0.5.3
 scikit-learn==1.7.0
 scipy==1.16.0
-sentence-transformers==4.1.0
+sentence-transformers==2.7.0
 six==1.17.0
 smmap==5.0.2
 sniffio==1.3.1
@@ -105,10 +106,10 @@ threadpoolctl==3.6.0
 tiktoken==0.9.0
 tokenizers==0.21.2
 toml==0.10.2
-torch==2.0.1
+torch==2.2.2
 tornado==6.5.1
 tqdm==4.67.1
-transformers==4.53.0
+transformers==4.41.2
 typing-inspect==0.9.0
 typing-inspection==0.4.1
 typing_extensions==4.14.0
